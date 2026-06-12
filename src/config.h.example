@@ -1,0 +1,15 @@
+#pragma once
+// このファイルを config.h にコピーして実際の値を設定する。
+
+// WiFi設定
+const char* wifi_ssid = "YOUR_WIFI_SSID";
+const char* wifi_pass = "YOUR_WIFI_PASSWORD";
+
+// PIR 検出ログ送信先（不要なら pir_endpoint を空文字にする）
+const char* pir_endpoint = "";
+const char* api_key      = "";  // X-API-Key ヘッダ
+
+// 毎分0秒に1秒間表示するメッセージ（TM1637 セグメントパターン4桁、全0で無効）
+// セグメントビット: A=0x01 B=0x02 C=0x04 D=0x08 E=0x10 F=0x20 G=0x40
+// 例: { 0x76, 0x79, 0x38, 0x38 } → "HELL"
+const uint8_t minute_banner[4] = { 0x00, 0x00, 0x00, 0x00 };
