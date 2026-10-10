@@ -14,9 +14,7 @@
 #include "TM1637.h"
 #include <WebServer.h>
 #include <esp_ota_ops.h>
-#include <esp_flash_encrypt.h>
-#include <esp_spi_flash.h>
-#include "esp32/rom/spi_flash.h"
+#include <Update.h>
 #include <stdarg.h>
 
 #define CLK 32  // TM1637 CLK ピン
@@ -154,21 +152,6 @@ void diagRecord(uint8_t type);  // forward declaration
 void setupServerHandlers();     // forward declaration
 void startServer();             // forward declaration
 void stopServer();              // forward declaration
-
-// Core 0 flash writer: struct と globals（setup() より前に宣言必須）
-struct FlashOpReq {
-  const esp_partition_t* part;
-  bool   is_erase;
-  size_t offset;
-  size_t len;
-  const void* data;
-};
-static QueueHandle_t     flash_op_queue  = NULL;
-static SemaphoreHandle_t flash_op_done   = NULL;
-static esp_err_t         flash_op_result = ESP_OK;
-static void flashOpTask(void* param);  // forward declaration
-static esp_err_t flashErase(const esp_partition_t* part, size_t off, size_t len);
-static esp_err_t flashWrite(const esp_partition_t* part, size_t off, const void* data, size_t len);
 
 static const char* diagTypeName(uint8_t type)
 {
@@ -808,11 +791,6 @@ void setup()
   send_queue = xQueueCreate(2, sizeof(int));
   xTaskCreatePinnedToCore(sendWorker, "send", 20480, NULL, 1, NULL, 0);
 
-  // Core 0 flash writer（HTTP upload 中の IPC デッドロック回避）
-  flash_op_queue = xQueueCreate(1, sizeof(FlashOpReq));
-  flash_op_done  = xSemaphoreCreateBinary();
-  xTaskCreatePinnedToCore(flashOpTask, "flash", 4096, NULL, 5, NULL, 0);
-
   // 100ms Ticker開始
   tk.attach_ms(ticker_period, TcoGen);
 }
@@ -822,131 +800,7 @@ void setup()
 WebServer server(80);
 bool      server_running = false;
 
-// ----- Core 0 flash writer（HTTP upload 中の IPC デッドロック回避）-----
-// HTTP upload は Core 1。flash write は両 core のキャッシュ無効化 IPC が必要。
-// Core 0 WiFi タスクが割り込み禁止中だと Core 1→Core 0 の IPC が届かず silently fail。
-// Core 0 から実行すれば Core 1（待機中）への IPC は届く。
-// struct/globals は上部（forward declaration 直後）で定義済み。
-static void flashOpTask(void* param)
-{
-  FlashOpReq req;
-  while (true) {
-    if (xQueueReceive(flash_op_queue, &req, portMAX_DELAY) != pdTRUE) continue;
-    if (req.is_erase) {
-      flash_op_result = esp_partition_erase_range(req.part, req.offset, req.len);
-    } else {
-      flash_op_result = esp_partition_write(req.part, req.offset, req.data, req.len);
-    }
-    xSemaphoreGive(flash_op_done);
-  }
-}
-
-static esp_err_t flashErase(const esp_partition_t* part, size_t off, size_t len)
-{
-  FlashOpReq req = {part, true, off, len, NULL};
-  xQueueSend(flash_op_queue, &req, portMAX_DELAY);
-  xSemaphoreTake(flash_op_done, portMAX_DELAY);
-  return flash_op_result;
-}
-
-static esp_err_t flashWrite(const esp_partition_t* part, size_t off, const void* data, size_t len)
-{
-  FlashOpReq req = {part, false, off, len, data};
-  xQueueSend(flash_op_queue, &req, portMAX_DELAY);
-  xSemaphoreTake(flash_op_done, portMAX_DELAY);
-  return flash_op_result;
-}
-
-// ----- ブラウザ OTA アップロードハンドラ（パーティション直接書き込み）-----
-// esp_ota_begin() を呼ぶと WIP マーカーガードが有効になり、sector 0 への
-// すべての書き込みが block される（esp_ota_end() でも解除不可）。
-// 回避策: OTA API を完全に bypass し esp_partition_write() で直接書く。
-// sector 0 は最後に書くことで WIP マーカーを回避する。
-static const esp_partition_t* ota_upload_part    = NULL;
-static esp_err_t              ota_upload_err     = ESP_OK;
-static bool                   ota_first_logged   = false;
-static size_t                 ota_write_offset   = 0;     // 書き込み位置（sector 1 以降）
-static uint8_t                ota_sec0_buf[4096];          // sector 0 バッファ（最後に書く）
-static size_t                 ota_sec0_size      = 0;
-static volatile bool          ota_flash_write_pending = false; // loop() で sector0 書き込みを延期
-static bool                   ota_staging_done       = false; // sector0 staging 書き込み済み
-static bool                   ota_staging_attempted  = false; // staging を1度だけ試みたか
-
-// Note: performDeferredOTAWrite() 削除済み。
-// sector0 は NVS 経由 + startup コンテキストで書き込む（startServer() 内の NVS pending check を参照）。
-// HTTP handler / WiFi 実行中はすべての sector0 書き込みが silently fail するため。
-
-// ----- OTA診断: otadataリセット + sector0 書き込み再試行 -----
-// 過去の esp_ota_begin() が残した WIP エントリが sector0 write をブロックしている仮説を検証
-void handleOtaReset()
-{
-  // 1) otadata の内容を読んで状態確認
-  const esp_partition_t* otadata = esp_partition_find_first(
-      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, NULL);
-  if (!otadata) {
-    webLogf("ota-reset: otadata partition not found\n");
-    server.send(500, "text/plain", "otadata not found");
-    return;
-  }
-
-  // otadata 先頭 32 バイト（2つの esp_ota_select_entry_t の一部）を読む
-  uint8_t ota_buf[32] = {0};
-  spi_flash_read(otadata->address, ota_buf, sizeof(ota_buf));
-  webLogf("otadata[0..7]:   %02x%02x%02x%02x %02x%02x%02x%02x\n",
-          ota_buf[0],ota_buf[1],ota_buf[2],ota_buf[3],
-          ota_buf[4],ota_buf[5],ota_buf[6],ota_buf[7]);
-  webLogf("otadata[8..15]:  %02x%02x%02x%02x %02x%02x%02x%02x\n",
-          ota_buf[8],ota_buf[9],ota_buf[10],ota_buf[11],
-          ota_buf[12],ota_buf[13],ota_buf[14],ota_buf[15]);
-  webLogf("otadata[16..23]: %02x%02x%02x%02x %02x%02x%02x%02x\n",
-          ota_buf[16],ota_buf[17],ota_buf[18],ota_buf[19],
-          ota_buf[20],ota_buf[21],ota_buf[22],ota_buf[23]);
-
-  // 2) app1 sector0 の現在値
-  const esp_partition_t* app1 = esp_ota_get_next_update_partition(NULL);
-  if (app1) {
-    uint8_t s0[4] = {0};
-    spi_flash_read(app1->address, s0, 4);
-    webLogf("app1 sector0 before: %02x%02x%02x%02x\n",
-            s0[0],s0[1],s0[2],s0[3]);
-  }
-
-  // 3) otadata を消去（WIP エントリを削除）
-  esp_err_t ota_err = esp_partition_erase_range(otadata, 0, otadata->size);
-  webLogf("otadata erase: 0x%x\n", ota_err);
-
-  // 4) otadata 消去後の内容確認
-  spi_flash_read(otadata->address, ota_buf, 8);
-  webLogf("otadata after erase[0..7]: %02x%02x%02x%02x %02x%02x%02x%02x\n",
-          ota_buf[0],ota_buf[1],ota_buf[2],ota_buf[3],
-          ota_buf[4],ota_buf[5],ota_buf[6],ota_buf[7]);
-
-  // 5) otadata 消去後に app1 sector0 を erase + write 再試行
-  if (app1) {
-    uint8_t s0_before[4] = {0};
-    spi_flash_read(app1->address, s0_before, 4);
-    webLogf("app1 sector0 before erase: %02x%02x%02x%02x\n",
-            s0_before[0],s0_before[1],s0_before[2],s0_before[3]);
-
-    esp_err_t erase_err = esp_partition_erase_range(app1, 0, SPI_FLASH_SEC_SIZE);
-    webLogf("app1 sector0 erase: 0x%x\n", erase_err);
-
-    uint8_t s0_after[4] = {0};
-    spi_flash_read(app1->address, s0_after, 4);
-    webLogf("app1 sector0 after erase: %02x%02x%02x%02x\n",
-            s0_after[0],s0_after[1],s0_after[2],s0_after[3]);
-
-    bool erase_ok = (s0_after[0] == 0xFF && s0_after[1] == 0xFF &&
-                     s0_after[2] == 0xFF && s0_after[3] == 0xFF);
-    webLogf("app1 sector0 erase result: %s\n",
-            erase_ok ? "SUCCESS (ffffffff)" : "FAILED (unchanged)");
-  }
-
-  server.send(200, "text/html; charset=utf-8",
-    "<html><head><meta http-equiv='refresh' content='5;url=/log'>"
-    "</head><body><p>OTA reset 実行。5秒後に /log で結果確認</p></body></html>");
-}
-
+// ----- ブラウザ OTA（標準 Update ライブラリ）-----
 void handleUpdatePage()
 {
   server.send(200, "text/html; charset=utf-8",
@@ -964,23 +818,21 @@ void handleUpdatePage()
 
 void handleUpdateDone()
 {
-  if (ota_upload_err == ESP_OK && ota_flash_write_pending) {
-    // staging 書き込み成功 → 再起動して startup コンテキストで sector0 を転記
-    server.send(200, "text/html; charset=utf-8",
-      "<html><head></head><body>"
-      "<p>Upload OK. リブート後に sector0 を書き込みます。"
-      "約15秒後に <a href='/log'>/log</a> で結果確認できます。</p>"
-      "</body></html>");
-    delay(1000);   // HTTP レスポンスの TCP フラッシュを待つ
-    ESP.restart();
-  } else {
-    char msg[160];
-    snprintf(msg, sizeof(msg),
-      "<html><body><p>OTA 失敗 (esp_err=0x%x)。"
-      "<a href='/update'>戻る</a></p></body></html>",
-      ota_upload_err);
+  if (Update.hasError()) {
+    String msg = "<html><body><p>OTA 失敗: ";
+    msg += Update.errorString();
+    msg += "。<a href='/update'>戻る</a></p></body></html>";
     server.send(500, "text/html; charset=utf-8", msg);
+    return;
   }
+  server.send(200, "text/html; charset=utf-8",
+    "<html><head></head><body>"
+    "<p>Upload OK. リブートします。"
+    "約15秒後に <a href='/log'>/log</a> で結果確認できます。</p>"
+    "</body></html>");
+  diagSave();
+  delay(1000);   // HTTP レスポンスの TCP フラッシュを待つ
+  ESP.restart();
 }
 
 void handleUpdateUpload()
@@ -989,206 +841,25 @@ void handleUpdateUpload()
 
   if (upload.status == UPLOAD_FILE_START) {
     webLogf("OTA upload start: %s\n", upload.filename.c_str());
-    ota_upload_err        = ESP_OK;
-    ota_first_logged      = false;
-    ota_write_offset      = SPI_FLASH_SEC_SIZE;  // sector 1 から書く（sector 0 は最後）
-    ota_sec0_size         = 0;
-    ota_staging_done      = false;
-    ota_staging_attempted = false;
-    memset(ota_sec0_buf, 0xFF, sizeof(ota_sec0_buf));
-
-    ota_upload_part = esp_ota_get_next_update_partition(NULL);
-    if (!ota_upload_part) {
-      ota_upload_err = ESP_ERR_NOT_FOUND;
-      webLogf("OTA: no update partition\n");
-      return;
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      webLogf("OTA begin failed: %s\n", Update.errorString());
     }
-    webLogf("OTA part: %s @ 0x%x size=0x%x\n",
-            ota_upload_part->label, ota_upload_part->address, ota_upload_part->size);
-    webLogf("flash enc mode: %d (0=off 1=dev 2=release)\n",
-            (int)esp_get_flash_encryption_mode());
-    webLogf("free heap: %u\n", esp_get_free_heap_size());
-    // esp_ota_begin() は呼ばない（WIP ガードを起動させないため）
 
   } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (ota_upload_err != ESP_OK) return;
-
-    const uint8_t *src = upload.buf;
-    size_t remaining   = upload.currentSize;
-
-    if (!ota_first_logged && remaining >= 4) {
-      ota_first_logged = true;
-      webLogf("OTA recv[0..3]: %02x%02x%02x%02x\n",
-              src[0], src[1], src[2], src[3]);
-    }
-
-    // sector 0 をバッファに蓄積（最初の 4096 バイト）
-    if (ota_sec0_size < sizeof(ota_sec0_buf)) {
-      size_t take = sizeof(ota_sec0_buf) - ota_sec0_size;
-      if (take > remaining) take = remaining;
-      memcpy(ota_sec0_buf + ota_sec0_size, src, take);
-      ota_sec0_size += take;
-      src       += take;
-      remaining -= take;
-    }
-
-    // sector0 バッファが揃った瞬間に1度だけ: warmup write → staging 書き込みを試行
-    // ota_staging_attempted で2回目以降をスキップ（毎 chunk で繰り返すと crash/timeout）
-    if (!ota_staging_attempted && ota_sec0_size == sizeof(ota_sec0_buf)) {
-      ota_staging_attempted = true;
-      const uint32_t STAGING_MAGIC    = 0xDEADBEEF;
-      const uint32_t STAGING_DATA_OFF = 0x100000;
-      const uint32_t STAGING_HDR_OFF  = 0x101000;
-
-      // sec0 バッファ先頭確認
-      webLogf("OTA: sec0buf[0..3]=%02x%02x%02x%02x\n",
-              ota_sec0_buf[0], ota_sec0_buf[1], ota_sec0_buf[2], ota_sec0_buf[3]);
-
-      // warmup: sector1 (0x1000) に Core 0 経由で書いて IPC 到達を確認
-      // sector1+ ループで後ほど上書きされるので害なし
-      uint32_t warmup[4] = {0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00};
-      esp_err_t ewu = flashErase(ota_upload_part, SPI_FLASH_SEC_SIZE, SPI_FLASH_SEC_SIZE);
-      esp_err_t wwu = flashWrite(ota_upload_part, SPI_FLASH_SEC_SIZE, warmup, 16);
-      uint8_t vwu[4] = {0};
-      spi_flash_read(ota_upload_part->address + SPI_FLASH_SEC_SIZE, vwu, 4);
-      bool warmup_ok = (vwu[0] == 0x44 && vwu[1] == 0x33 && vwu[2] == 0x22 && vwu[3] == 0x11);
-      webLogf("OTA: warmup(Core0)@0x1000 e=0x%x w=0x%x rb=%02x%02x%02x%02x -> %s\n",
-              ewu, wwu, vwu[0], vwu[1], vwu[2], vwu[3], warmup_ok ? "OK" : "FAIL");
-
-      // staging 書き込み（Core 0 経由）
-      webLogf("OTA: staging phys_hdr=0x%x\n", ota_upload_part->address + STAGING_HDR_OFF);
-      esp_err_t ea = flashErase(ota_upload_part, STAGING_DATA_OFF, SPI_FLASH_SEC_SIZE);
-      esp_err_t wa = flashWrite(ota_upload_part, STAGING_DATA_OFF,
-                                ota_sec0_buf, sizeof(ota_sec0_buf));
-      esp_err_t eb = flashErase(ota_upload_part, STAGING_HDR_OFF, SPI_FLASH_SEC_SIZE);
-      uint8_t hdr[8];
-      uint32_t sz32 = (uint32_t)sizeof(ota_sec0_buf);
-      memcpy(hdr,     &STAGING_MAGIC, 4);
-      memcpy(hdr + 4, &sz32,          4);
-      esp_err_t wb = flashWrite(ota_upload_part, STAGING_HDR_OFF, hdr, 8);
-
-      uint8_t vhdr[8] = {0};
-      spi_flash_read(ota_upload_part->address + STAGING_HDR_OFF, vhdr, 8);
-      uint32_t vmag = vhdr[0] | ((uint32_t)vhdr[1]<<8) |
-                      ((uint32_t)vhdr[2]<<16) | ((uint32_t)vhdr[3]<<24);
-      ota_staging_done = (ea==ESP_OK && wa==ESP_OK && eb==ESP_OK && wb==ESP_OK &&
-                          vmag == STAGING_MAGIC);
-      webLogf("OTA: staging ea=0x%x wa=0x%x eb=0x%x wb=0x%x vmag=0x%08x -> %s\n",
-              ea, wa, eb, wb, vmag, ota_staging_done ? "OK" : "FAIL");
-      // 失敗しても abort しない: sector1+ を継続し UPLOAD_FILE_END で再試行する
-    }
-
-    // sector 1 以降: Core 0 経由で消去→書き込み
-    while (remaining > 0) {
-      if ((ota_write_offset % SPI_FLASH_SEC_SIZE) == 0) {
-        esp_err_t err = flashErase(ota_upload_part, ota_write_offset, SPI_FLASH_SEC_SIZE);
-        if (err != ESP_OK) {
-          ota_upload_err = err;
-          webLogf("OTA erase failed @ 0x%x: 0x%x\n", ota_write_offset, err);
-          return;
-        }
-      }
-      size_t space      = SPI_FLASH_SEC_SIZE - (ota_write_offset % SPI_FLASH_SEC_SIZE);
-      size_t write_size = (remaining < space) ? remaining : space;
-      esp_err_t err = flashWrite(ota_upload_part, ota_write_offset, src, write_size);
-      if (err != ESP_OK) {
-        ota_upload_err = err;
-        webLogf("OTA write failed @ 0x%x: 0x%x\n", ota_write_offset, err);
-        return;
-      }
-      ota_write_offset += write_size;
-      src              += write_size;
-      remaining        -= write_size;
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      webLogf("OTA write failed: %s\n", Update.errorString());
     }
 
   } else if (upload.status == UPLOAD_FILE_END) {
-    if (ota_upload_err != ESP_OK) return;
-
-    // sector 0 を最後に書く（OTA ハンドルなし → WIP ガードなし）
-    uint32_t phys0 = ota_upload_part->address;  // sector 0 物理アドレス
-
-    // フラッシュチップ情報
-    uint32_t chip_id = 0;
-    esp_flash_read_id(NULL, &chip_id);
-    webLogf("flash chip id: 0x%06x\n", chip_id);
-
-    // SR1/SR2 読み取り（ROM関数経由）
-    uint32_t sr_lo = 0, sr_hi = 0;
-    esp_rom_spiflash_read_status(&g_rom_flashchip, &sr_lo);
-    esp_rom_spiflash_read_statushigh(&g_rom_flashchip, &sr_hi);
-    webLogf("SR1=0x%02x SR2=0x%02x (CMP=%d QE=%d)\n",
-            sr_lo & 0xFF, sr_hi & 0xFF,
-            (int)((sr_hi >> 6) & 1), (int)((sr_hi >> 1) & 1));
-
-    // CMP(bit6) と BP ビットをクリアして全保護を解除
-    // QE(bit1) 等の他ビットは保持する
-    bool needs_sr_clear = (sr_hi & 0x40) || (sr_lo & 0x7C);
-    if (needs_sr_clear) {
-      uint32_t new_sr1 = sr_lo & ~0x7C;          // BP[2:0], TB, SEC をクリア
-      uint32_t new_sr2 = sr_hi & ~0x40;          // CMP をクリア
-      uint32_t new_status = (new_sr1 & 0xFF) | ((new_sr2 & 0xFF) << 8);
-      webLogf("clearing SR1 BP + SR2 CMP, new_status=0x%04x\n", new_status);
-      int r = esp_rom_spiflash_write_status(&g_rom_flashchip, new_status);
-      webLogf("write_status: %d\n", r);
-      // 確認
-      esp_rom_spiflash_read_status(&g_rom_flashchip, &sr_lo);
-      esp_rom_spiflash_read_statushigh(&g_rom_flashchip, &sr_hi);
-      webLogf("SR1=0x%02x SR2=0x%02x after clear\n", sr_lo & 0xFF, sr_hi & 0xFF);
-    }
-
-    // sector 0 物理値確認（startup erase の効果確認: ffffffff なら startup erase OK）
-    uint8_t pre[4] = {0};
-    spi_flash_read(phys0, pre, 4);
-    webLogf("sector0 before write[0..3]: %02x%02x%02x%02x\n",
-            pre[0], pre[1], pre[2], pre[3]);
-
-    // sector 1 物理値確認（UPLOAD_FILE_WRITE の書き込みが効いたか確認）
-    // ffffffff = sector1+ も silently fail、それ以外 = 正常書き込み
-    uint8_t sec1[4] = {0};
-    spi_flash_read(phys0 + SPI_FLASH_SEC_SIZE, sec1, 4);
-    webLogf("sector1 after upload[0..3]: %02x%02x%02x%02x\n",
-            sec1[0], sec1[1], sec1[2], sec1[3]);
-
-    // sector 0 バッファ内容確認
-    webLogf("ota_sec0_buf[0..3]: %02x%02x%02x%02x total=%u\n",
-            ota_sec0_buf[0], ota_sec0_buf[1], ota_sec0_buf[2], ota_sec0_buf[3],
-            upload.totalSize);
-
-    // staging が UPLOAD_FILE_WRITE で未完了なら END コンテキスト（sector1+ 書き込み後）で再試行
-    if (!ota_staging_done) {
-      const uint32_t STAGING_MAGIC    = 0xDEADBEEF;
-      const uint32_t STAGING_DATA_OFF = 0x100000;
-      const uint32_t STAGING_HDR_OFF  = 0x101000;
-      webLogf("OTA: retrying staging in END context (Core 0)\n");
-      esp_err_t ea2 = flashErase(ota_upload_part, STAGING_DATA_OFF, SPI_FLASH_SEC_SIZE);
-      esp_err_t wa2 = flashWrite(ota_upload_part, STAGING_DATA_OFF,
-                                 ota_sec0_buf, sizeof(ota_sec0_buf));
-      esp_err_t eb2 = flashErase(ota_upload_part, STAGING_HDR_OFF, SPI_FLASH_SEC_SIZE);
-      uint8_t hdr2[8];
-      uint32_t sz32b = (uint32_t)sizeof(ota_sec0_buf);
-      memcpy(hdr2,     &STAGING_MAGIC, 4);
-      memcpy(hdr2 + 4, &sz32b,         4);
-      esp_err_t wb2 = flashWrite(ota_upload_part, STAGING_HDR_OFF, hdr2, 8);
-      uint8_t vhdr2[8] = {0};
-      spi_flash_read(ota_upload_part->address + STAGING_HDR_OFF, vhdr2, 8);
-      uint32_t vmag2 = vhdr2[0] | ((uint32_t)vhdr2[1]<<8) |
-                       ((uint32_t)vhdr2[2]<<16) | ((uint32_t)vhdr2[3]<<24);
-      ota_staging_done = (ea2==ESP_OK && wa2==ESP_OK && eb2==ESP_OK && wb2==ESP_OK &&
-                          vmag2 == STAGING_MAGIC);
-      webLogf("OTA: staging retry ea=0x%x wa=0x%x eb=0x%x wb=0x%x vmag=0x%08x -> %s\n",
-              ea2, wa2, eb2, wb2, vmag2, ota_staging_done ? "OK" : "FAIL");
-    }
-
-    if (!ota_staging_done) {
-      webLogf("OTA: staging FAILED in both WRITE and END contexts\n");
-      ota_upload_err = ESP_FAIL;
+    if (Update.end(true)) {
+      webLogf("OTA upload OK: %u bytes\n", (unsigned)upload.totalSize);
     } else {
-      ota_flash_write_pending = true;
-      webLogf("OTA: staging OK. Will write sector0 on next startup.\n");
+      webLogf("OTA end failed: %s (%u bytes)\n",
+              Update.errorString(), (unsigned)upload.totalSize);
     }
 
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    ota_upload_err = ESP_FAIL;
+    Update.abort();
     webLogf("OTA upload aborted\n");
   }
 }
@@ -1244,112 +915,12 @@ void setupServerHandlers()
   server.on("/diag/save", HTTP_GET,  handleDiagSave);
   server.on("/update",    HTTP_GET,  handleUpdatePage);
   server.on("/update",    HTTP_POST, handleUpdateDone, handleUpdateUpload);
-  server.on("/ota-reset", HTTP_GET,  handleOtaReset);
 }
 
 void startServer()
 {
   if (server_running) return;
 
-  // staging 領域チェック: sector0 データが staging に書かれていれば startup コンテキストで転記
-  // （HTTP handler / WiFi 実行中は sector0 書き込みが silently fail → app1 末尾2セクターを staging に使用）
-  {
-    const esp_partition_t* tgt = esp_ota_get_next_update_partition(NULL);
-    if (tgt) {
-      const uint32_t STAGING_MAGIC    = 0xDEADBEEF;
-      const uint32_t STAGING_DATA_OFF = 0x100000;
-      const uint32_t STAGING_HDR_OFF  = 0x101000;
-
-      uint8_t vhdr[8] = {0};
-      spi_flash_read(tgt->address + STAGING_HDR_OFF, vhdr, 8);
-      uint32_t magic   = vhdr[0] | ((uint32_t)vhdr[1]<<8) |
-                         ((uint32_t)vhdr[2]<<16) | ((uint32_t)vhdr[3]<<24);
-      uint32_t sec0_sz = vhdr[4] | ((uint32_t)vhdr[5]<<8) |
-                         ((uint32_t)vhdr[6]<<16) | ((uint32_t)vhdr[7]<<24);
-      webLogf("OTA startup: staging magic=0x%08x sec0_sz=%u\n", magic, sec0_sz);
-
-      if (magic == STAGING_MAGIC && sec0_sz > 0 && sec0_sz <= SPI_FLASH_SEC_SIZE) {
-        webLogf("OTA startup: staging found! Reading sector0 data...\n");
-
-        static uint8_t staging_sec0[SPI_FLASH_SEC_SIZE];
-        spi_flash_read(tgt->address + STAGING_DATA_OFF, staging_sec0, SPI_FLASH_SEC_SIZE);
-        webLogf("OTA startup: staging[0..3]=%02x%02x%02x%02x\n",
-                staging_sec0[0], staging_sec0[1], staging_sec0[2], staging_sec0[3]);
-
-        // staging 領域を先に消去（失敗しても無限ループ防止）
-        esp_partition_erase_range(tgt, STAGING_DATA_OFF, SPI_FLASH_SEC_SIZE);
-        esp_partition_erase_range(tgt, STAGING_HDR_OFF,  SPI_FLASH_SEC_SIZE);
-
-        // 現在の sector0 物理値
-        uint8_t cur[4] = {0};
-        spi_flash_read(tgt->address, cur, 4);
-        webLogf("OTA startup: sector0 current=%02x%02x%02x%02x\n",
-                cur[0], cur[1], cur[2], cur[3]);
-
-        // 0→1 遷移があれば erase が必要
-        bool need_erase = false;
-        for (int i = 0; i < 4; i++) {
-          if (cur[i] & ~staging_sec0[i]) { need_erase = true; break; }
-        }
-        if (need_erase) {
-          webLogf("OTA startup: erasing sector0...\n");
-          esp_err_t ee = esp_partition_erase_range(tgt, 0, SPI_FLASH_SEC_SIZE);
-          webLogf("OTA startup: erase 0x%x\n", ee);
-        }
-
-        esp_err_t we = esp_partition_write(tgt, 0, staging_sec0, sec0_sz);
-        webLogf("OTA startup: write 0x%x\n", we);
-
-        uint8_t after[4] = {0};
-        spi_flash_read(tgt->address, after, 4);
-        webLogf("OTA startup: sector0 after=%02x%02x%02x%02x (want %02x%02x%02x%02x)\n",
-                after[0], after[1], after[2], after[3],
-                staging_sec0[0], staging_sec0[1], staging_sec0[2], staging_sec0[3]);
-
-        bool verify_ok = (after[0] == staging_sec0[0] && after[1] == staging_sec0[1] &&
-                          after[2] == staging_sec0[2] && after[3] == staging_sec0[3]);
-        if (verify_ok) {
-          esp_err_t boot_err = esp_ota_set_boot_partition(tgt);
-          webLogf("OTA startup: set_boot 0x%x\n", boot_err);
-          if (boot_err == ESP_OK) {
-            webLogf("OTA startup: SUCCESS! Rebooting to new firmware...\n");
-            diagSave();
-            delay(200);
-            ESP.restart();
-          } else {
-            webLogf("OTA startup: set_boot FAILED 0x%x\n", boot_err);
-          }
-        } else {
-          webLogf("OTA startup: write FAILED (mismatch)\n");
-        }
-      }
-    }
-  }
-
-  // OTAパーティションにゴミデータが残っていれば消去（起動毎に1回チェック）
-  // 注意: 有効なファームウェアヘッダ(0xE9)があれば消去しない
-  static bool ota_checked = false;
-  if (!ota_checked) {
-    ota_checked = true;
-    const esp_partition_t* next = esp_ota_get_next_update_partition(NULL);
-    if (next) {
-      uint8_t buf[4] = {0};
-      spi_flash_read(next->address, buf, 4);
-      webLogf("OTA: next part sector0 physical: %02x%02x%02x%02x\n",
-              buf[0], buf[1], buf[2], buf[3]);
-      if (buf[0] == 0xFF && buf[1] == 0xFF && buf[2] == 0xFF && buf[3] == 0xFF) {
-        // クリーン（all 0xFF）: 何もしない
-      } else if (buf[0] == 0xE9) {
-        // 有効なファームウェアヘッダ: 消去しない
-        webLogf("OTA: next part has firmware (0xE9), skip erase\n");
-      } else {
-        // ゴミデータ: 消去
-        webLogf("OTA: partition dirty (garbage), erasing...\n");
-        esp_err_t err = esp_partition_erase_range(next, 0, next->size);
-        webLogf("OTA: erase %s\n", err == ESP_OK ? "done" : "FAILED");
-      }
-    }
-  }
 
   // パーティション情報
   const esp_partition_t* running = esp_ota_get_running_partition();
