@@ -45,6 +45,13 @@ void tm1637WriteRaw(uint8_t pos, uint8_t seg)
 // NTP・時刻設定
 const int   gmt_offset = (3600 * 9) + 60 * 7;  // JST+9 + 7分進め
 const int   daylight   = 0;                      // サマータイムなし
+
+// ログ用の実 JST（7分進めなし）。TZ 設定前の起動直後でも正しい時刻になる
+struct tm* jstTime(const time_t* t)
+{
+  time_t jst = *t + 9 * 3600;
+  return gmtime(&jst);
+}
 const char* ntp_server  = "ntp.jst.mfeed.ad.jp";
 const char* ntp_server2 = "ntp.nict.jp";
 const char* ntp_server3 = "pool.ntp.org";
@@ -235,7 +242,7 @@ void diagPrint()
   if (diag_last_ok == 0) {
     Serial.println("Last OK  : (none)");
   } else {
-    struct tm* t = localtime(&diag_last_ok);
+    struct tm* t = jstTime(&diag_last_ok);
     Serial.printf("Last OK  : %04d-%02d-%02d %02d:%02d:%02d\n",
       t->tm_year+1900, t->tm_mon+1, t->tm_mday,
       t->tm_hour, t->tm_min, t->tm_sec);
@@ -252,7 +259,7 @@ void diagPrint()
         : "?";
       Serial.printf("[---- boot ----] %s (%s)\n", diagTypeName(type), reason);
     } else {
-      struct tm* t = localtime(&ts);
+      struct tm* t = jstTime(&ts);
       Serial.printf("[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
         t->tm_year+1900, t->tm_mon+1, t->tm_mday,
         t->tm_hour, t->tm_min, t->tm_sec,
@@ -273,7 +280,7 @@ String diagGetString()
   if (diag_last_ok == 0) {
     s += "Last OK  : (none)\n";
   } else {
-    struct tm* t = localtime(&diag_last_ok);
+    struct tm* t = jstTime(&diag_last_ok);
     char buf[64];
     snprintf(buf, sizeof(buf), "Last OK  : %04d-%02d-%02d %02d:%02d:%02d\n",
       t->tm_year+1900, t->tm_mon+1, t->tm_mday,
@@ -292,7 +299,7 @@ String diagGetString()
         : "?";
       snprintf(buf, sizeof(buf), "[---- boot ----] %s (%s)\n", diagTypeName(type), reason);
     } else {
-      struct tm* t = localtime(&ts);
+      struct tm* t = jstTime(&ts);
       snprintf(buf, sizeof(buf), "[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
         t->tm_year+1900, t->tm_mon+1, t->tm_mday,
         t->tm_hour, t->tm_min, t->tm_sec,
@@ -329,7 +336,7 @@ void webLogf(const char* fmt, ...)
   char line[WEBLOG_LINE_LEN];
   time_t now = time(NULL);
   if (now > 1000000000UL) {
-    struct tm* t = localtime(&now);
+    struct tm* t = jstTime(&now);
     snprintf(line, sizeof(line), "[%02d:%02d:%02d] %s",
       t->tm_hour, t->tm_min, t->tm_sec, msg);
   } else {
@@ -882,9 +889,22 @@ void handleLog()
   server.sendContent("</pre></body></html>");
 }
 
+// WiFi 電波強度（RSSI）の表示用文字列。未接続なら「未接続」
+String rssiString()
+{
+  if (WiFi.status() != WL_CONNECTED) return "RSSI: 未接続";
+  int rssi = WiFi.RSSI();
+  const char* q = rssi >= -50 ? "とても良い"
+                : rssi >= -67 ? "良好"
+                : rssi >= -75 ? "やや弱い"
+                :               "不安定";
+  return "RSSI: " + String(rssi) + " dBm（" + q + "） ch " + String(WiFi.channel());
+}
+
 void handleDiag()
 {
   String body = "<html><head><title>Diag</title></head><body><pre>";
+  body += rssiString() + "\n\n";
   body += diagGetString();
   body += "</pre><a href='/diag/save'><button>Save to flash</button></a></body></html>";
   server.send(200, "text/html; charset=utf-8", body);
@@ -903,6 +923,7 @@ void setupServerHandlers()
     server.send(200, "text/html; charset=utf-8",
       "<html><head><title>m5atom-clock</title></head><body>"
       "<h2>m5atom-clock</h2>"
+      "<p>" + rssiString() + "</p>"
       "<ul>"
       "<li><a href='/log'>Log</a> &mdash; 動作ログ（直近300行）</li>"
       "<li><a href='/diag'>Diag</a> &mdash; 診断ログ（NVS保存）</li>"
